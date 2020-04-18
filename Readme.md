@@ -17,8 +17,8 @@ You can now move on to the next section
 
 ### Download models & config
 
-Download the [DialoGPT 345M model, and the reverse](https://github.com/microsoft/DialoGPT#models) model and place in `medium/`
-Download these [config files](https://github.com/microsoft/DialoGPT/tree/master/configs) and place in `config/`
+- Download the [DialoGPT 345M model, and the reverse](https://github.com/microsoft/DialoGPT#models) model and place in `medium/`
+- Download these [config files](https://github.com/microsoft/DialoGPT/tree/master/configs) and place in `config/`
 
 
 ## Local Development
