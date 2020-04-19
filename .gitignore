@@ -1,3 +1,12 @@
 venv
 medium
 config
+.DS_Store
+gpt_personachat_cache_v2/
+*dataset_cache*
+experiments/
+data/
+dataset_cache*
+runs/
+ParlAI/
+__pycache__
