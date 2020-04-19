@@ -98,14 +98,16 @@ def generate_message(message_list: list, focus_last_message=True):
         result = _get_response(total_input[:, -1:], past)
         score = _score_response(result[0].to(device_r), total_input_reversed.to(device_r))
         results.append(result + (score,))
+        # results.append(result)
 
     scores = torch.stack([x[2] for x in results], dim=0)
     winner = torch.multinomial(F.softmax(scores / MMI_temperature, dim=0), num_samples=1).item()
-    # winner = torch.argmax(scores, dim=0)
+    winner = torch.argmax(scores, dim=0)
 
     out = results[winner][0]
 
     return tokenizer.decode(out.tolist()[0], skip_special_tokens=True)
+    # return tokenizer.decode(results[0][0])
 
 
 if __name__ == '__main__':
