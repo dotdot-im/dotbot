@@ -1,118 +1,201 @@
+import json
+from os.path import abspath, dirname, exists, join
+import argparse
+import logging
+from tqdm import trange
+import tqdm
 import torch
 import torch.nn.functional as F
-from transformers import GPT2Tokenizer, GPT2LMHeadModel, GPT2Config
-from config import device_f, device_r, num_samples, MMI_temperature, top_k
+import numpy as np
+import socket
+import os, sys
+import re
+import logging
+from functools import partial
+# from demo_utils import download_model_folder
+import argparse
+import subprocess as sp
 
-torch.set_grad_enabled(False)
+from transformers import GPT2LMHeadModel, GPT2Tokenizer, GPT2Config
+from gpt2_training.train_utils import get_eval_list_same_length, load_model, boolean_string, fix_state_dict_namespace
 
-tokenizer = GPT2Tokenizer('config/vocab.json', 'config/merges.txt')
-
-weights = torch.load('medium/medium_ft.pkl')
-# fix misused key value
-weights["lm_head.weight"] = weights["lm_head.decoder.weight"]
-weights.pop("lm_head.decoder.weight", None)
-
-cfg = GPT2Config.from_json_file('config/config.json')
-model: GPT2LMHeadModel = GPT2LMHeadModel(cfg)
-model.load_state_dict(weights)
-if device_f == 'cuda':
-    model.half()
-model.to(device_f)
-model.eval()
-
-weights = torch.load('medium/small_reverse.pkl')
-# fix misused key value
-weights["lm_head.weight"] = weights["lm_head.decoder.weight"]
-weights.pop("lm_head.decoder.weight", None)
-
-reverse_model: GPT2LMHeadModel = GPT2LMHeadModel(cfg)
-reverse_model.load_state_dict(weights)
-if device_r == 'cuda':
-    reverse_model.half()
-reverse_model.to(device_r)
-reverse_model.eval()
+logging.basicConfig(format = '%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
+                    datefmt = '%m/%d/%Y %H:%M:%S',
+                    level = logging.INFO)
+logger = logging.getLogger(__name__)
 
 
-end_token = torch.tensor([[50256]], dtype=torch.long)
+EOS_ID = 50256
 
 
-def _get_response(output_token, past):
-    out = torch.tensor([[]], dtype=torch.long, device=device_f)
-
-    while True:
-        output_token, past = model.forward(output_token, past=past)
-        output_token = output_token[:, -1, :].float()
-        indices_to_remove = output_token < torch.topk(output_token, top_k)[0][..., -1, None]
-        output_token[indices_to_remove] = -float('Inf')
-        output_token = torch.multinomial(F.softmax(output_token, dim=-1), num_samples=1)
-
-        out = torch.cat((out, output_token), dim=1)
-
-        if output_token.item() == end_token.item():
+def cut_seq_to_eos(sentence, remove_id=[-1]):
+    sent=[]
+    for s in sentence:
+        if s in remove_id:
+            continue
+        if s != EOS_ID:
+            sent.append(s)
+        else:
             break
-
-    return out, past
-
-
-def _score_response(output_token, correct_token):
-    inputs = torch.cat((output_token, correct_token), dim=1)
-    mask = torch.full_like(output_token, -1, dtype=torch.long)
-    labels = torch.cat((mask, correct_token), dim=1)
-
-    loss, _, _ = reverse_model(inputs, labels=labels)
-
-    return -loss.float()
+    return sent
 
 
-def append_messages(old_list: list, new_list: list, truncate_length=64):
-    for message in new_list:
-        if message != '':
-            input_token = tokenizer.encode(message, return_tensors='pt')
-            input_token = torch.cat((input_token, end_token), dim=1)
-            old_list.append(input_token)
+### FROM HUGGING FACE REPO
+def top_filtering(logits, top_k=0, top_p=0.0, threshold=-float('Inf'), filter_value=-float('Inf')):
+    """ Filter a distribution of logits using top-k, top-p (nucleus) and/or threshold filtering
+        Args:
+            logits: logits distribution shape (vocabulary size)
+            top_k: <=0: no filtering, >0: keep only top k tokens with highest probability.
+            top_p: <=0.0: no filtering, >0.0: keep only a subset S of candidates, where S is the smallest subset
+                whose total probability mass is greater than or equal to the threshold top_p.
+                In practice, we select the highest probability tokens whose cumulative probability mass exceeds
+                the threshold top_p.
+            threshold: a minimal threshold to keep logits
+    """
+    assert logits.dim() == 1  # Only work for batch size 1 for now - could update but it would obfuscate a bit the code
+    top_k = min(top_k, logits.size(-1))
+    if top_k > 0:
+        # Remove all tokens with a probability less than the last token in the top-k tokens
+        indices_to_remove = logits < torch.topk(logits, top_k)[0][..., -1, None]
+        logits[indices_to_remove] = filter_value
 
-    if len(old_list) == 0:
-        old_list.append(end_token)
+    if top_p > 0.0:
+        # Compute cumulative probabilities of sorted tokens
+        sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+        cumulative_probabilities = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
 
-    # truncate
-    total_length = 0
-    for i, message in enumerate(reversed(old_list)):
-        total_length += message.shape[1]
-        if total_length > truncate_length:
-            old_list[:] = old_list[-i:]
+        # Remove tokens with cumulative probability above the threshold
+        sorted_indices_to_remove = cumulative_probabilities > top_p
+        # Shift the indices to the right to keep also the first token above the threshold
+        sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+        sorted_indices_to_remove[..., 0] = 0
+
+        # Back to unsorted indices and set them to -infinity
+        indices_to_remove = sorted_indices[sorted_indices_to_remove]
+        logits[indices_to_remove] = filter_value
+
+    indices_to_remove = logits < threshold
+    logits[indices_to_remove] = filter_value
+    return logits
+
+def generate_next_token(model, input_ids, position_ids=None, token_type_ids=None, prev=None, temperature=1, top_k=0, top_p=0, past=None):
+    with torch.no_grad():
+        if not past:
+            hidden_states, past = model.transformer(prev, position_ids, token_type_ids, past=past)
+        else:
+            hidden_states, past = model.transformer(prev, past=past)
+        logits = model.lm_head(hidden_states)
+        logits = logits[0, -1, :] / temperature
+        logits = top_filtering(logits, top_k=top_k, top_p=top_p)
+        probs = F.softmax(logits.unsqueeze(0), dim=-1)
+        prev = torch.multinomial(probs, num_samples=1)
+        return prev, probs[0][prev], past
+
+def generate_sequence(model, input_ids, position_ids=None, token_type_ids=None, temperature=1, top_k=0, top_p=0, length=20, past=None, device='cuda'):
+    output = input_ids.new_zeros([input_ids.size(0),0])
+    prev = input_ids
+    for i in range(length):
+        prev, probs, past = generate_next_token(model, input_ids, position_ids, token_type_ids, prev, temperature, top_k, top_p, past)
+        output = torch.cat((output, prev), dim=1)
+    return output
+
+def cut_seq_to_eos(sentence, remove_id=[-1]):
+    sent=[]
+    for s in sentence:
+        if s in remove_id:
+            continue
+        if s != EOS_ID:
+            sent.append(s)
+        else:
+            break
+    return sent
 
 
-def generate_message(message_list: list, focus_last_message=True):
-    total_input = torch.cat(message_list, dim=1).to(device_f)
-    if focus_last_message:
-        total_input_reversed = message_list[-1]
-    else:
-        total_input_reversed = torch.cat(list(reversed(message_list)), dim=1)
+def run_model():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--fp16", type=boolean_string, default=False)
+    parser.add_argument("--max_seq_length", type=int, default=128)
+    
+    parser.add_argument("--generation_length", type=int, default=20)
+    parser.add_argument("--max_history", type=int, default=2)
 
-    past = None
-    if total_input.shape[1] > 1:
-        _, past = model(total_input[:, :-1])
+    parser.add_argument("--temperature", type=float, default=1)
+    parser.add_argument("--top_k", type=int, default=0)
+    parser.add_argument("--top_p", type=float, default=0.9)
 
-    results = []
-    for i in range(num_samples):
-        result = _get_response(total_input[:, -1:], past)
-        score = _score_response(result[0].to(device_r), total_input_reversed.to(device_r))
-        results.append(result + (score,))
+    parser.add_argument('--use_gpu', action='store_true')
+    parser.add_argument("--gpu", type=int, default=0)
 
-    scores = torch.stack([x[2] for x in results], dim=0)
-    winner = torch.multinomial(F.softmax(scores / MMI_temperature, dim=0), num_samples=1).item()
-    # winner = torch.argmax(scores, dim=0)
+    args = parser.parse_args()
+    os.environ['CUDA_VISIBLE_DEVICES'] = str(args.gpu)
 
-    out = results[winner][0]
 
-    return tokenizer.decode(out.tolist()[0], skip_special_tokens=True)
+    device = torch.device("cuda" if torch.cuda.is_available() and args.use_gpu else "cpu")
+    n_gpu = torch.cuda.device_count()
+    args.device, args.n_gpu = device, n_gpu
 
+    np.random.seed(args.seed)
+    torch.random.manual_seed(args.seed)
+    torch.cuda.manual_seed(args.seed)
+
+    #### load the GPT-2 model 
+    config = GPT2Config.from_json_file('./config/config.json')
+    enc = GPT2Tokenizer.from_pretrained('./config')
+    model = load_model(GPT2LMHeadModel(config), './medium/medium_ft.pkl', args, verbose=True)
+    model.to(device)
+    model.eval()
+
+    history = []
+    while True:
+        raw_text = input("USR >>> ")
+        while not raw_text:
+            print('Prompt should not be empty!')
+            raw_text = input("USR >>> ")
+        history.append(raw_text)
+        context_tokens = sum([enc.encode(h) + [EOS_ID] for h in history],[]) #+ [EOS_ID]
+        context_tokens = torch.tensor(context_tokens, device=device, dtype=torch.long).unsqueeze(0)
+        position_ids = torch.arange(0, context_tokens.size(-1), dtype=torch.long, device=context_tokens.device)
+
+        out = generate_sequence(model, context_tokens, position_ids=position_ids,
+                                length=args.generation_length, temperature=args.temperature, 
+                                top_k=args.top_k, top_p= args.top_p) 
+
+        out = out.tolist()                        
+        text = enc.decode(cut_seq_to_eos(out[0])).encode('ascii','ignore').decode('ascii')
+        print("SYS >>> ", text)
+        history.append(text)
+        history = history[-(2*args.max_history+1):]
 
 if __name__ == '__main__':
-    my_message_list = []
-    while True:
-        my_message = input('usr >> ')
-        append_messages(my_message_list, [my_message])
-        my_response = generate_message(my_message_list)
-        print('bot >>', my_response)
-        append_messages(my_message_list, [my_response])
+
+    PYTHON_EXE = 'python'
+    MODEL_FOLDER = './medium'
+    DATA_FOLDER = './data'
+
+    logging.basicConfig(
+        format='%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
+        datefmt='%m/%d/%Y %H:%M:%S', level=logging.INFO
+    )
+    logger = logging.getLogger(__name__)
+
+
+    # if os.path.exists(MODEL_FOLDER):
+    #     print('Found existing ./models folder, skip creating a new one!')
+    #     os.makedirs(MODEL_FOLDER, exist_ok=True)
+    # else:
+    #     os.makedirs(MODEL_FOLDER)
+
+    #########################################################################
+    # Download Model
+    #########################################################################
+    # logger.info('Downloading models...')
+    # download_model = partial(download_model_folder, DATA_FOLDER=MODEL_FOLDER)
+
+    # model size:  could be one of 'small' (GPT2 with 117M), 'medium'(345M) or 'large' (1542M)
+    # dataset: one of 'multiref' or 'dstc'
+    # from_scratch: True : load model trained from scratch or False: load model trained from fine-tuning the GPT-2
+    # target_folder = download_model(model_size='medium', dataset='multiref', from_scratch=False)
+    # logger.info('Done!\n')
+    
+    run_model()
