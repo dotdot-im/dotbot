@@ -8,6 +8,7 @@ from argparse import ArgumentParser
 from itertools import chain
 from pprint import pformat
 import warnings
+import os
 
 import torch
 import torch.nn.functional as F
@@ -148,6 +149,7 @@ def run():
         history = history[-(2*args.max_history+1):]
         out_text = tokenizer.decode(out_ids, skip_special_tokens=True)
         print(out_text)
+        os.system('say ' + out_text)
 
 
 if __name__ == "__main__":
