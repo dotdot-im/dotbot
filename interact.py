@@ -1,120 +1,156 @@
+# # Copyright (c) 2019-present, HuggingFace Inc.
+# All rights reserved.
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+import logging
+import random
+from argparse import ArgumentParser
+from itertools import chain
+from pprint import pformat
+import warnings
+import os
+
 import torch
 import torch.nn.functional as F
-from transformers import GPT2Tokenizer, GPT2LMHeadModel, GPT2Config
-from config import device_f, device_r, num_samples, MMI_temperature, top_k
 
-torch.set_grad_enabled(False)
+from transformers import OpenAIGPTLMHeadModel, OpenAIGPTTokenizer, GPT2LMHeadModel, GPT2Tokenizer
+from train import SPECIAL_TOKENS, build_input_from_segments, add_special_tokens_
+from utils import get_dataset, download_pretrained_model
 
-tokenizer = GPT2Tokenizer('config/vocab.json', 'config/merges.txt')
+def top_filtering(logits, top_k=0., top_p=0.9, threshold=-float('Inf'), filter_value=-float('Inf')):
+    """ Filter a distribution of logits using top-k, top-p (nucleus) and/or threshold filtering
+        Args:
+            logits: logits distribution shape (vocabulary size)
+            top_k: <=0: no filtering, >0: keep only top k tokens with highest probability.
+            top_p: <=0.0: no filtering, >0.0: keep only a subset S of candidates, where S is the smallest subset
+                whose total probability mass is greater than or equal to the threshold top_p.
+                In practice, we select the highest probability tokens whose cumulative probability mass exceeds
+                the threshold top_p.
+            threshold: a minimal threshold to keep logits
+    """
+    assert logits.dim() == 1  # Only work for batch size 1 for now - could update but it would obfuscate a bit the code
+    top_k = min(top_k, logits.size(-1))
+    if top_k > 0:
+        # Remove all tokens with a probability less than the last token in the top-k tokens
+        indices_to_remove = logits < torch.topk(logits, top_k)[0][..., -1, None]
+        logits[indices_to_remove] = filter_value
 
-weights = torch.load('medium/medium_ft.pkl')
-# fix misused key value
-weights["lm_head.weight"] = weights["lm_head.decoder.weight"]
-weights.pop("lm_head.decoder.weight", None)
+    if top_p > 0.0:
+        # Compute cumulative probabilities of sorted tokens
+        sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+        cumulative_probabilities = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
 
-cfg = GPT2Config.from_json_file('config/config.json')
-model: GPT2LMHeadModel = GPT2LMHeadModel(cfg)
-model.load_state_dict(weights)
-if device_f == 'cuda':
-    model.half()
-model.to(device_f)
-model.eval()
+        # Remove tokens with cumulative probability above the threshold
+        sorted_indices_to_remove = cumulative_probabilities > top_p
+        # Shift the indices to the right to keep also the first token above the threshold
+        sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+        sorted_indices_to_remove[..., 0] = 0
 
-weights = torch.load('medium/small_reverse.pkl')
-# fix misused key value
-weights["lm_head.weight"] = weights["lm_head.decoder.weight"]
-weights.pop("lm_head.decoder.weight", None)
+        # Back to unsorted indices and set them to -infinity
+        indices_to_remove = sorted_indices[sorted_indices_to_remove]
+        logits[indices_to_remove] = filter_value
 
-reverse_model: GPT2LMHeadModel = GPT2LMHeadModel(cfg)
-reverse_model.load_state_dict(weights)
-if device_r == 'cuda':
-    reverse_model.half()
-reverse_model.to(device_r)
-reverse_model.eval()
+    indices_to_remove = logits < threshold
+    logits[indices_to_remove] = filter_value
+
+    return logits
 
 
-end_token = torch.tensor([[50256]], dtype=torch.long)
+def sample_sequence(personality, history, tokenizer, model, args, current_output=None):
+    special_tokens_ids = tokenizer.convert_tokens_to_ids(SPECIAL_TOKENS)
+    if current_output is None:
+        current_output = []
 
+    for i in range(args.max_length):
+        instance = build_input_from_segments(personality, history, current_output, tokenizer, with_eos=False)
 
-def _get_response(output_token, past):
-    out = torch.tensor([[]], dtype=torch.long, device=device_f)
+        input_ids = torch.tensor(instance["input_ids"], device=args.device).unsqueeze(0)
+        token_type_ids = torch.tensor(instance["token_type_ids"], device=args.device).unsqueeze(0)
 
-    while True:
-        output_token, past = model.forward(output_token, past=past)
-        output_token = output_token[:, -1, :].float()
-        indices_to_remove = output_token < torch.topk(output_token, top_k)[0][..., -1, None]
-        output_token[indices_to_remove] = -float('Inf')
-        output_token = torch.multinomial(F.softmax(output_token, dim=-1), num_samples=1)
+        logits = model(input_ids, token_type_ids=token_type_ids)
+        if isinstance(logits, tuple):  # for gpt2 and maybe others
+            logits = logits[0]
+        logits = logits[0, -1, :] / args.temperature
+        logits = top_filtering(logits, top_k=args.top_k, top_p=args.top_p)
+        probs = F.softmax(logits, dim=-1)
 
-        out = torch.cat((out, output_token), dim=1)
+        prev = torch.topk(probs, 1)[1] if args.no_sample else torch.multinomial(probs, 1)
+        if i < args.min_length and prev.item() in special_tokens_ids:
+            while prev.item() in special_tokens_ids:
+                if probs.max().item() == 1:
+                    warnings.warn("Warning: model generating special token with probability 1.")
+                    break  # avoid infinitely looping over special token
+                prev = torch.multinomial(probs, num_samples=1)
 
-        if output_token.item() == end_token.item():
+        if prev.item() in special_tokens_ids:
             break
+        current_output.append(prev.item())
 
-    return out, past
+    return current_output
 
+def run():
+    parser = ArgumentParser()
+    parser.add_argument("--dataset_path", type=str, default="", help="Path or url of the dataset. If empty download from S3.")
+    parser.add_argument("--dataset_cache", type=str, default='./dataset_cache', help="Path or url of the dataset cache")
+    parser.add_argument("--model", type=str, default="openai-gpt", help="Model type (openai-gpt or gpt2)", choices=['openai-gpt', 'gpt2'])  # anything besides gpt2 will load openai-gpt
+    parser.add_argument("--model_checkpoint", type=str, default="", help="Path, url or short name of the model")
+    parser.add_argument("--max_history", type=int, default=2, help="Number of previous utterances to keep in history")
+    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Device (cuda or cpu)")
 
-def _score_response(output_token, correct_token):
-    inputs = torch.cat((output_token, correct_token), dim=1)
-    mask = torch.full_like(output_token, -1, dtype=torch.long)
-    labels = torch.cat((mask, correct_token), dim=1)
+    parser.add_argument("--no_sample", action='store_true', help="Set to use greedy decoding instead of sampling")
+    parser.add_argument("--max_length", type=int, default=20, help="Maximum length of the output utterances")
+    parser.add_argument("--min_length", type=int, default=1, help="Minimum length of the output utterances")
+    parser.add_argument("--seed", type=int, default=0, help="Seed")
+    parser.add_argument("--temperature", type=int, default=0.7, help="Sampling softmax temperature")
+    parser.add_argument("--top_k", type=int, default=0, help="Filter top-k tokens before sampling (<=0: no filtering)")
+    parser.add_argument("--top_p", type=float, default=0.9, help="Nucleus filtering (top-p) before sampling (<=0.0: no filtering)")
+    args = parser.parse_args()
 
-    loss, _, _ = reverse_model(inputs, labels=labels)
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger(__file__)
+    logger.info(pformat(args))
 
-    return -loss.float()
-
-
-def append_messages(old_list: list, new_list: list, truncate_length=64):
-    for message in new_list:
-        if message != '':
-            input_token = tokenizer.encode(message, return_tensors='pt')
-            input_token = torch.cat((input_token, end_token), dim=1)
-            old_list.append(input_token)
-
-    if len(old_list) == 0:
-        old_list.append(end_token)
-
-    # truncate
-    total_length = 0
-    for i, message in enumerate(reversed(old_list)):
-        total_length += message.shape[1]
-        if total_length > truncate_length:
-            old_list[:] = old_list[-i:]
-
-
-def generate_message(message_list: list, focus_last_message=True):
-    total_input = torch.cat(message_list, dim=1).to(device_f)
-    if focus_last_message:
-        total_input_reversed = message_list[-1]
-    else:
-        total_input_reversed = torch.cat(list(reversed(message_list)), dim=1)
-
-    past = None
-    if total_input.shape[1] > 1:
-        _, past = model(total_input[:, :-1])
-
-    results = []
-    for i in range(num_samples):
-        result = _get_response(total_input[:, -1:], past)
-        score = _score_response(result[0].to(device_r), total_input_reversed.to(device_r))
-        results.append(result + (score,))
-        # results.append(result)
-
-    scores = torch.stack([x[2] for x in results], dim=0)
-    winner = torch.multinomial(F.softmax(scores / MMI_temperature, dim=0), num_samples=1).item()
-    winner = torch.argmax(scores, dim=0)
-
-    out = results[winner][0]
-
-    return tokenizer.decode(out.tolist()[0], skip_special_tokens=True)
-    # return tokenizer.decode(results[0][0])
+    if args.model_checkpoint == "":
+        if args.model == 'gpt2':
+            raise ValueError("Interacting with GPT2 requires passing a finetuned model_checkpoint")
+        else:
+            args.model_checkpoint = download_pretrained_model()
+	
+	
+    if args.seed != 0:
+    	random.seed(args.seed)
+    	torch.random.manual_seed(args.seed)
+    	torch.cuda.manual_seed(args.seed)
 
 
-if __name__ == '__main__':
-    my_message_list = []
+    logger.info("Get pretrained model and tokenizer")
+    tokenizer_class, model_class = (GPT2Tokenizer, GPT2LMHeadModel) if args.model == 'gpt2' else (OpenAIGPTTokenizer, OpenAIGPTLMHeadModel)
+    tokenizer = tokenizer_class.from_pretrained(args.model_checkpoint)
+    model = model_class.from_pretrained(args.model_checkpoint)
+    model.to(args.device)
+    add_special_tokens_(model, tokenizer)
+
+    logger.info("Sample a personality")
+    dataset = get_dataset(tokenizer, args.dataset_path, args.dataset_cache)
+    personalities = [dialog["personality"] for dataset in dataset.values() for dialog in dataset]
+    personality = random.choice(personalities)
+    logger.info("Selected personality: %s", tokenizer.decode(chain(*personality)))
+
+    history = []
     while True:
-        my_message = input('usr >> ')
-        append_messages(my_message_list, [my_message])
-        my_response = generate_message(my_message_list)
-        print('bot >>', my_response)
-        append_messages(my_message_list, [my_response])
+        raw_text = input(">>> ")
+        while not raw_text:
+            print('Prompt should not be empty!')
+            raw_text = input(">>> ")
+        history.append(tokenizer.encode(raw_text))
+        with torch.no_grad():
+            out_ids = sample_sequence(personality, history, tokenizer, model, args)
+        history.append(out_ids)
+        history = history[-(2*args.max_history+1):]
+        out_text = tokenizer.decode(out_ids, skip_special_tokens=True)
+        print(out_text)
+        os.system('say ' + out_text)
+
+
+if __name__ == "__main__":
+    run()
