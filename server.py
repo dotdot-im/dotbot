@@ -1,16 +1,19 @@
 import web
 import json
 
+from bot import bot
+
 urls = (
     '/', 'interactive'
 )
 app = web.application(urls, globals())
+bot = bot()
 
 class interactive:
     def GET(self):
-        user_data = web.input(id="no data")
+        data = web.input(persona=[], chat_history=[], reply=None)
         response = {
-            'user_id': user_data.id,
+            'text': bot.get_text(data.persona, data.chat_history, data.reply)
         }
 
         web.header('Content-Type', 'application/json')
